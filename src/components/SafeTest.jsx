@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback} from "react";
 
 import Safe, { SafeFactory } from "@safe-global/safe-core-sdk";
 import EthersAdapter from "@safe-global/safe-ethers-lib";
@@ -18,6 +18,7 @@ const SafeTest = () => {
   const [threshold, setThreshold] = useState();
   const [changeThresholdVal, setChangeThresholdVal] = useState();
   const [nicknames, setNicknames] = useState({});
+  const [currentAccount, setCurrentAccount] = useState();
 
   // app functionality
   const [isAlertVisible, setIsAlertVisible] = useState(false);
@@ -73,11 +74,16 @@ const SafeTest = () => {
         nickname: `owner ${owners.length - index}`,
       }));
 
+      const { 0: currentAccount } = await window.ethereum.request({
+        method: "eth_requestAccounts",
+      });
+
       await Promise.all([
         setSafe(safeSdk),
         setSafeAddress(await safeSdk.getAddress()),
         setThreshold(await safeSdk.getThreshold()),
         setOwners(owners),
+        setCurrentAccount(currentAccount),
         setNicknames(
           Object.fromEntries(
             ownersWithNicknames.map((o) => [o.owner, o.nickname])
@@ -89,7 +95,7 @@ const SafeTest = () => {
       successMessageDisplay("Successfully Connected to the Safe!");
     } catch (error) {
       setIsLoading(false);
-      errorMessageDisplay("Error connecting to safe ", error);
+      errorMessageDisplay(error.message);
     }
   };
 
@@ -148,11 +154,16 @@ const SafeTest = () => {
         nickname: names[owners.length - (index + 1)] || `owner ${index + 1}`,
       }));
 
+      const { 0: currentAccount } = await window.ethereum.request({
+        method: "eth_requestAccounts",
+      });
+
       await Promise.all([
         setSafe(safeSdk),
         setSafeAddress(await safeSdk.getAddress()),
         setThreshold(await safeSdk.getThreshold()),
         setOwners(owners),
+        setCurrentAccount(currentAccount),
         setNicknames(
           Object.fromEntries(
             ownersWithNicknames.map((o) => [o.owner, o.nickname])
@@ -160,51 +171,47 @@ const SafeTest = () => {
         ),
       ]);
       successMessageDisplay("Successfully created new safe!");
-      setIsLoading(false);
     } catch (error) {
       setIsLoading(false);
-      errorMessageDisplay("Error creating new safe ", error);
+      errorMessageDisplay(error.message);
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const addOwner = async (e) => {
-    e.preventDefault();
-    if (window.confirm("Are you sure you want to add this owner?")) {
       try {
         setIsLoading(true);
         const params = { ownerAddress: newOwnerInput };
         const safeTransaction = await safe.createAddOwnerTx(params);
 
         if (threshold > 1) {
-          getOwnerSignatures(safeTransaction);
+          handleSigning(safeTransaction);
         } else {
           await safe.signTransaction(safeTransaction);
           const txResponse = await safe.executeTransaction(safeTransaction);
           await txResponse.transactionResponse.wait();
         }
 
-        const newOwners = [...owners, newOwnerInput];
-        setOwners(newOwners);
+        setOwners(await safe.getOwners());
         const newNicknames = { ...nicknames, [newOwnerInput]: "Owner" };
         setNicknames(newNicknames);
-        setIsLoading(false);
         successMessageDisplay("Successfully Added Owner!");
       } catch (error) {
         setIsLoading(false);
-        errorMessageDisplay("Error Adding Owner ", error);
+        errorMessageDisplay(error.message);
+      } finally {
+        setIsLoading(false);
       }
-    }
   };
 
-  const removeOwner = async (e, owner) => {
-    e.preventDefault();
-    if (window.confirm("Are you sure you want to remove this owner?")) {
+  const removeOwner = async (owner) => {
       try {
         setIsLoading(true);
         if (threshold > 1) {
           const params = { ownerAddress: owner };
           const safeTransaction = await safe.createRemoveOwnerTx(params);
-          getOwnerSignatures(safeTransaction);
+          handleSigning(safeTransaction);
         } else {
           const params = { ownerAddress: owner, threshold: threshold };
           const safeTransaction = await safe.createRemoveOwnerTx(params);
@@ -213,96 +220,141 @@ const SafeTest = () => {
           await txResponse.transactionResponse?.wait();
         }
 
-        const newOwners = owners.filter((o) => o !== owner);
         const newNicknames = { ...nicknames };
         delete newNicknames[owner];
 
-        setOwners(newOwners);
+        setOwners(await safe.getOwners());
         setNicknames(newNicknames);
-        setIsLoading(false);
         successMessageDisplay("Successfully removed the owner from the Safe!");
       } catch (error) {
         setIsLoading(false);
-        errorMessageDisplay("Error removing owner ", error);
+        errorMessageDisplay(error.message);
+      } finally {
+        setIsLoading(false);
       }
-    }
   };
 
   const changeThreshold = async (e) => {
-    e.preventDefault();
-
-    if (window.confirm("Are you sure you want to change the threshold?")) {
       try {
         setIsLoading(true);
         const safeTransaction = await safe.createChangeThresholdTx(
           changeThresholdVal
         );
         if (threshold > 1) {
-          await getOwnerSignatures(safeTransaction);
+          await handleSigning(safeTransaction);
+          setThreshold(await safe.getThreshold());
         } else {
           await safe.signTransaction(safeTransaction);
           const txResponse = await safe.executeTransaction(safeTransaction);
           await txResponse.transactionResponse?.wait();
+          setThreshold(await safe.getThreshold());
+          successMessageDisplay("Successfully changed the threshold!");
         }
-        setThreshold(await safe.getThreshold());
-        setIsLoading(false);
-        successMessageDisplay("Successfully changed the threshold!");
       } catch (error) {
+        errorMessageDisplay(error.message);
+      } finally {
         setIsLoading(false);
-        errorMessageDisplay("Error changing threshold ", error);
       }
-    }
   };
 
-  // HELPER: get owner signatures
-  const getOwnerSignatures = async (safeTransaction) => {
-    const safes = [safe];
-    const provider = new ethers.providers.Web3Provider(window.ethereum);
+  //-------------------------updates/additions:-------------------------------------------------------
 
-    // off chain signature
-    await safe.signTransaction(safeTransaction);
-    const txHash = await safe.getTransactionHash(safeTransaction);
+  // handles signing of transactions
+  async function handleSigning(safeTransaction) {
+    try {
+      const txHash = await safe.getTransactionHash(safeTransaction);
+      const transactionSigners = await safe.getOwnersWhoApprovedTx(txHash);
+      const { length: signerCount } = transactionSigners;
 
-    // on chain signature
-    for (let i = threshold - 2; i >= 0; i--) {
-      const signer = provider.getSigner(owners[i]);
-      const ethAdapterOwner = new EthersAdapter({
-        ethers,
-        signerOrProvider: signer,
-      });
-
-      const currentSafe = safes[0];
-      const safeSdk = await currentSafe.connect({
-        ethAdapter: ethAdapterOwner,
-        safeAddress: safeAddress,
-      });
-      safes.pop();
-      safes.push(safeSdk);
-      const approveTxResponse = await safeSdk.approveTransactionHash(txHash);
-      await approveTxResponse.transactionResponse?.wait();
+      if (signerCount === 0 || !(transactionSigners.map(singers => singers.toLowerCase()).includes(currentAccount.toLowerCase()))) {
+        switch (signerCount) {
+          // when the signer count is 0, current owner will sign it
+          case 0:
+            await safe.signTransaction(safeTransaction);
+            successMessageDisplay("Signed by current account! Switch to the next owner to approve/execute");
+            break;
+          default:
+            // when the signer count is > 0, then the current owner will approve it
+            if ((threshold - signerCount) > 1) { 
+              await safe.signTransaction(safeTransaction);
+              const approveTxResponse = await safe.approveTransactionHash(txHash);
+              await approveTxResponse?.transactionResponse.wait();
+              successMessageDisplay("Approved by current owner! Switch to the next owner to approve/execute");
+            } else {
+              // when at the last signer, execute it
+              await safe.signTransaction(safeTransaction);
+              const executeTxResponse = await safe.executeTransaction(safeTransaction);
+              await executeTxResponse?.transactionResponse.wait();
+              successMessageDisplay("Successfully changed the threshold!");
+            }
+            break;
+        }
+      } else if ((threshold - signerCount) === 0) { 
+        if (((transactionSigners[signerCount-1]).toLowerCase()) === currentAccount.toLowerCase()) {
+          // when the transactino is fully signed and are at the last signer, execute it
+          const executeTxResponse = await safe.executeTransaction(safeTransaction);
+          await executeTxResponse?.transactionResponse.wait();
+          successMessageDisplay("Successfully changed the threshold!");
+        } else {
+          throw new Error("To execute the transaction, please switch to this owner: " + transactionSigners[signerCount-1]);
+        }
+      } else { 
+        throw new Error("Current account has already signed the transaction");
+      } 
+    } catch (error) {
+      throw error;
     }
+  }
 
-    // now we can execute the transaction (done by the last approver)
-    const signer = provider.getSigner(owners[threshold - 1]);
-    const ethAdapterOwnerLast = new EthersAdapter({
-      ethers,
-      signerOrProvider: signer,
-    });
-    const currentSafe = safes[0];
-    const safeSdkLast = await currentSafe.connect({
-      ethAdapter: ethAdapterOwnerLast,
-      safeAddress,
-    });
-
-    if (await safeSdkLast.isValidTransaction(safeTransaction)) {
-      const executeTxResponse = await safeSdkLast.executeTransaction(
-        safeTransaction
-      );
-      await executeTxResponse.transactionResponse?.wait();
-    } else {
-      throw new Error("Invalid Transaction");
+  // handles button clicks for adding and removing owners and changing threshold
+  async function handleButtonClick(e, action, ...args) {
+    e.preventDefault();
+    try {
+      if (window.confirm("Are you sure?")) {
+        if (owners.map(owner => owner.toLowerCase()).includes(currentAccount.toLowerCase())){
+          if (action === "addOwner") {
+            await addOwner();
+          }
+          if (action === "removeOwner") {
+            await removeOwner(...args);
+          }
+          if (action === "changeThreshold") {
+            await changeThreshold();
+          }
+        } else {
+          throw new Error("Current account is not an owner of the Safe");
+        }
+      }
+    } catch (error) {
+      errorMessageDisplay(error.message);
     }
-  };
+  }
+
+  // handles account changes
+  const accountChangedHandler = useCallback((newAccount) => {
+    setCurrentAccount(newAccount);
+  }, []);  
+
+  useEffect(() => {
+    // listens for account changes
+    window.ethereum?.on("accountsChanged", accountChangedHandler);
+
+    return () => {
+      window.ethereum?.removeListener("accountsChanged", accountChangedHandler);
+    };
+  })
+
+  useEffect(() => {
+    if (currentAccount !== null && typeof currentAccount == "object") {
+      accountChangedHandler(currentAccount[0]);
+      setCurrentAccount(currentAccount[0]);
+    }
+  }, [currentAccount, accountChangedHandler]);
+
+   // refresh page on network change
+   window.ethereum?.on("chainChanged", (chainId) => window.location.reload());
+
+  //-----------------------------new updates ends---------------------------------------------------
 
   useEffect(() => {
     const checkNetworkVersion = async () => {
@@ -532,7 +584,7 @@ const SafeTest = () => {
                         <button
                           className="button is-small is-danger"
                           disabled={isEditingNickname}
-                          onClick={(e) => removeOwner(e, owner)}
+                          onClick={(e) => handleButtonClick(e, "removeOwner", owner)}
                         >
                           Remove
                         </button>
@@ -577,7 +629,7 @@ const SafeTest = () => {
                 <button
                   className="button is-primary is-normal"
                   type="submit"
-                  onClick={changeThreshold}
+                  onClick={(e) => handleButtonClick(e, "changeThreshold")}
                 >
                   Change
                 </button>
@@ -592,7 +644,7 @@ const SafeTest = () => {
   const renderAddOwnerForm = () => {
     return (
       <div className="custom-box">
-        <form onSubmit={addOwner}>
+        <form onSubmit={(e) => handleButtonClick(e, "addOwner")}>
           <fieldset>
             <legend className="subtitle is-4">Add Owner</legend>
             <div className="field">
@@ -610,7 +662,7 @@ const SafeTest = () => {
             </div>
             <div className="field is-grouped">
               <div className="control">
-                <button className="button is-primary" onClick={addOwner}>
+                <button className="button is-primary" onClick={(e) => handleButtonClick(e, "addOwner")}>
                   Add Owner
                 </button>
               </div>
@@ -637,7 +689,7 @@ const SafeTest = () => {
   };
 
   const successMessageDisplay = (message) => {
-    setMessage(message);
+    setMessage(message.slice(0, 100));
     setIsAlertVisible(true);
     setTimeout(() => {
       setIsAlertVisible(false);
@@ -645,7 +697,7 @@ const SafeTest = () => {
   };
 
   const errorMessageDisplay = (message, error) => {
-    setErrorMessage(message, error);
+    setErrorMessage(message.slice(0, 100), error);
     setIsAlertVisible(true);
     setTimeout(() => {
       setIsAlertVisible(false);
@@ -665,7 +717,7 @@ const SafeTest = () => {
       {errorMessage && isAlertVisible && (
         <>
           <div className="message content box p-3">
-            <p className="has-text-danger">{errorMessage}</p>
+            <p className="has-text-danger">{errorMessage} </p>
           </div>
         </>
       )}
